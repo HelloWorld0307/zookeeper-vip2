@@ -75,6 +75,7 @@ public class ContainerManager {
                 @Override
                 public void run() {
                     try {
+                        // 对ttl和Container节点进行检查和删除
                         checkContainers();
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();

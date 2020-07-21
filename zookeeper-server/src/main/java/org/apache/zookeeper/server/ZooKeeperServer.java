@@ -443,9 +443,11 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     public void startdata()
     throws IOException, InterruptedException {
         //check to see if zkDb is not null
+        // 如果Zookeeper数据库还没有直接new一个新的
         if (zkDb == null) {
             zkDb = new ZKDatabase(this.txnLogFactory);
         }
+        // 如果Zookeeper的数据库还没有被初始化则加载磁盘中保存的快照信息
         if (!zkDb.isInitialized()) {
             loadData();
         }

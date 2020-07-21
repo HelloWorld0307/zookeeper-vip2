@@ -31,7 +31,9 @@ import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
  *
  * We use this instead of Properties as it's typed.
  *
+ * 单机情况下解析出来配置文件会转化为该配置类
  */
+
 @InterfaceAudience.Public
 public class ServerConfig {
     ////

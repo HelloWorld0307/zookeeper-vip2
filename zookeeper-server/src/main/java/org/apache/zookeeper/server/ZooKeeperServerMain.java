@@ -97,17 +97,21 @@ public class ZooKeeperServerMain {
         }
 
         ServerConfig config = new ServerConfig();
+        // 配置文件信息转化为ServerConfig
         if (args.length == 1) {
             config.parse(args[0]);
         } else {
             config.parse(args);
         }
 
+        // 运行
         runFromConfig(config);
     }
 
     /**
      * Run from a ServerConfig.
+     * 单机配置项转化为ServerConfig对象，接着直接运行此对象就运行了服务端
+     *
      * @param config ServerConfig to use.
      * @throws IOException
      * @throws AdminServerException
@@ -121,46 +125,65 @@ public class ZooKeeperServerMain {
             // so rather than spawning another thread, we will just call
             // run() in this thread.
             // create a file logger url from the command line args
+            // 日志和数据文件存放路径配置的工具类，利用此工具类可以用来存储日志数据和持久化数据
             txnLog = new FileTxnSnapLog(config.dataLogDir, config.dataDir);
+
+            // new一个ZooKeeper 的服务，启动下面zkServer就是启动了Zookeeper的服务端
             final ZooKeeperServer zkServer = new ZooKeeperServer(txnLog,
                     config.tickTime, config.minSessionTimeout, config.maxSessionTimeout, null);
             txnLog.setServerStats(zkServer.serverStats());
 
             // Registers shutdown handler which will be used to know the
             // server error or shutdown state changes.
+            // 启动一个 CountDownLatch 用来通过下面的AdminServer（管理台）来关闭Zookeeper，
+            // 主要机制：zookeeper启动的时候的主线程会阻塞在shutdownLatch.await()上
+            // 一旦在管理台中关闭zookeeper后会进行countDown（）进行减一操作，最后就主线程往下走执行了shutdown();关闭服务端
             final CountDownLatch shutdownLatch = new CountDownLatch(1);
             zkServer.registerServerShutdownHandler(
                     new ZooKeeperServerShutdownHandler(shutdownLatch));
 
-            // Start Admin server
+            // 使用Jetty启动一个可视化的监控管理台
             adminServer = AdminServerFactory.createAdminServer();
             adminServer.setZooKeeperServer(zkServer);
             adminServer.start();
 
             boolean needStartZKServer = true;
             if (config.getClientPortAddress() != null) {
+                // 默认拿到一个NIOServerCnxnFactory，这个工厂是用来处理每一个客户端的socket连接请求，一个sockt请求过来了，就会生成一个NIOServerCnxn
                 cnxnFactory = ServerCnxnFactory.createFactory();
+
+                // ServerSocketChannel 绑定地址和端口号，以及设定客户端的最大连接数
+                // 由于是有NIOServerCnxnFactory来生成NIOServerCnxn连接每一个请求，所以可以通过它可以控制客户端的最大连接数
                 cnxnFactory.configure(config.getClientPortAddress(), config.getMaxClientCnxns(), false);
+
+                // 启动Zookeeper服务端
                 cnxnFactory.startup(zkServer);
-                // zkServer has been started. So we don't need to start it again in secureCnxnFactory.
+
+                // 防止多次启动服务端
                 needStartZKServer = false;
             }
+
+
             if (config.getSecureClientPortAddress() != null) {
                 secureCnxnFactory = ServerCnxnFactory.createFactory();
                 secureCnxnFactory.configure(config.getSecureClientPortAddress(), config.getMaxClientCnxns(), true);
                 secureCnxnFactory.startup(zkServer, needStartZKServer);
             }
 
+            // 配置定时任务---ContainerManager用来对ttl和containor节点预处理
             containerManager = new ContainerManager(zkServer.getZKDatabase(), zkServer.firstProcessor,
                     Integer.getInteger("znode.container.checkIntervalMs", (int) TimeUnit.MINUTES.toMillis(1)),
                     Integer.getInteger("znode.container.maxPerMinute", 10000)
             );
+            // 启动定时任务来先检查然后删除满足条件的节点
             containerManager.start();
 
             // Watch status of ZooKeeper server. It will do a graceful shutdown
             // if the server is not running or hits an internal error.
+            // 主线程一直在这里等待，AdminServer对服务端状态的修改，一旦其他主线程外的其他线程指向了countDown方法后就会往下走
             shutdownLatch.await();
 
+            // Zookeeper服务端关闭前要先关闭其他服务
             shutdown();
 
             if (cnxnFactory != null) {
@@ -170,6 +193,7 @@ public class ZooKeeperServerMain {
                 secureCnxnFactory.join();
             }
             if (zkServer.canShutdown()) {
+                // Zookeeper服务端关闭
                 zkServer.shutdown(true);
             }
         } catch (InterruptedException e) {
@@ -177,6 +201,7 @@ public class ZooKeeperServerMain {
             LOG.warn("Server interrupted", e);
         } finally {
             if (txnLog != null) {
+                // 关闭日志和数据工具类
                 txnLog.close();
             }
         }

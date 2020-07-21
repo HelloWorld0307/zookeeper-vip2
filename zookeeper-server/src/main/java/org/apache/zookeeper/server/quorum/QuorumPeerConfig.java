@@ -55,6 +55,9 @@ import org.apache.zookeeper.server.quorum.flexible.QuorumMaj;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
 import org.apache.zookeeper.server.util.VerifyingFileFactory;
 
+/**
+ * 集群情况下解析出来配置文件会转化为该配置类
+ */
 @InterfaceAudience.Public
 public class QuorumPeerConfig {
     private static final Logger LOG = LoggerFactory.getLogger(QuorumPeerConfig.class);
@@ -126,6 +129,8 @@ public class QuorumPeerConfig {
 
     /**
      * Parse a ZooKeeper configuration file
+     * 根据传入的配置文件路径，通过读取文件内容转化为一个文件流得到一个Properties对象，最后将Properties对象内容一一的赋给QuorumPeerConfig对象
+     *
      * @param path the patch of the configuration file
      * @throws ConfigException error processing configuration
      */
@@ -146,7 +151,7 @@ public class QuorumPeerConfig {
             } finally {
                 in.close();
             }
-            
+            // 真正的解析配置文件内容
             parseProperties(cfg);
         } catch (IOException e) {
             throw new ConfigException("Error processing " + path, e);
@@ -227,7 +232,9 @@ public class QuorumPeerConfig {
 
     /**
      * Parse config from a Properties.
-     * @param zkProp Properties to parse from.
+     * 将zoo.cfg文件中所有的配置项使用if语句一一判断，最后转化为一个QuorumPeerConfig对象
+     *
+     * @param zkProp 通过zoo.cfg转化后的Properties对象
      * @throws IOException
      * @throws ConfigException
      */

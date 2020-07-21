@@ -122,14 +122,22 @@ public abstract class ServerCnxnFactory {
     }
 
     public abstract void closeAll();
-    
+
+    /**
+     * 通过此方法可以生成一个NIO的工厂，其功能主要是一旦有一个socket请求连接服务端，
+     * 那么就会生成一个NIOServerCnxn这样一个对象去处理这个连接请求
+     * @return
+     * @throws IOException
+     */
     static public ServerCnxnFactory createFactory() throws IOException {
         String serverCnxnFactoryName =
             System.getProperty(ZOOKEEPER_SERVER_CNXN_FACTORY);
+        // 默认是如果没有指派的话就是以NIO的形式开启一个服务端
         if (serverCnxnFactoryName == null) {
             serverCnxnFactoryName = NIOServerCnxnFactory.class.getName();
         }
         try {
+            // 通过反射的形式获取一个服务端上下文工厂
             ServerCnxnFactory serverCnxnFactory = (ServerCnxnFactory) Class.forName(serverCnxnFactoryName)
                     .getDeclaredConstructor().newInstance();
             LOG.info("Using {} as server connection factory", serverCnxnFactoryName);

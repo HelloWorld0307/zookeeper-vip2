@@ -83,6 +83,9 @@ public class DataTree {
      * This hashtable provides a fast lookup to the datanodes. The tree is the
      * source of truth and is where all the locking occurs
      */
+    /**
+     * 存储数据的真是结构，node存储的是key 和value一一对应，例如：/test --- node数据节点信息
+     */
     private final ConcurrentHashMap<String, DataNode> nodes =
         new ConcurrentHashMap<String, DataNode>();
 
@@ -126,18 +129,23 @@ public class DataTree {
 
     /**
      * This hashtable lists the paths of the ephemeral nodes of a session.
+     * 临时节点存储容器，临时节点与节点有关，所以其key存储的是long性的session值，value值为当前存储的
      */
     private final Map<Long, HashSet<String>> ephemerals =
         new ConcurrentHashMap<Long, HashSet<String>>();
 
     /**
      * This set contains the paths of all container nodes
+     * 容器节点：如果容器节点最后一个子节点删除后容器也会被删除，一个容器只有创建了子节点后才会可以被删除
      */
     private final Set<String> containers =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     /**
      * This set contains the paths of all ttl nodes
+     * ttl节点：存活时限（TTL，即Time To Life），TTL的单位是秒，当指定的秒数过去以后，如果相应的键或目录没有得到更新，就会被自动从Etcd记录中移除。
+     * Collections.newSetFromMap---高性能的Set可以通过Collections.newSetFromMap(ConcurrentHashMap)来构建，
+     * 使用ConcurrentHashMap保证并发性，使用包装的Map.keySet()作为容器，因此性能较高。
      */
     private final Set<String> ttls =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());

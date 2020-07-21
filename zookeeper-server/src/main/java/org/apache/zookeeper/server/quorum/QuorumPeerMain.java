@@ -74,7 +74,7 @@ public class QuorumPeerMain {
     /**
      * To start the replicated server specify the configuration file name on
      * the command line.
-     * @param args path to the configfile
+     * @param args zoo_example.cfg配置文件路径，即在idea中配置的文件路径
      */
     public static void main(String[] args) {
         QuorumPeerMain main = new QuorumPeerMain();
@@ -109,22 +109,26 @@ public class QuorumPeerMain {
         throws ConfigException, IOException, AdminServerException
     {
         QuorumPeerConfig config = new QuorumPeerConfig();
+        // 将配置文件zoo.cfg解析成一个QuorumPeerConfig对象
         if (args.length == 1) {
             config.parse(args[0]);
         }
 
         // Start and schedule the the purge task
+        // 开启一个定时任务，根据配置清空多余的日志和快照
         DatadirCleanupManager purgeMgr = new DatadirCleanupManager(config
                 .getDataDir(), config.getDataLogDir(), config
                 .getSnapRetainCount(), config.getPurgeInterval());
         purgeMgr.start();
 
         if (args.length == 1 && config.isDistributed()) {
+            // 集群情况走此方法
             runFromConfig(config);
         } else {
             LOG.warn("Either no config or no quorum defined in config, running "
                     + " in standalone mode");
             // there is only server in the quorum -- run as standalone
+            // 单机情况走的是下面方法
             ZooKeeperServerMain.main(args);
         }
     }
