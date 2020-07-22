@@ -307,10 +307,14 @@ public class NIOServerCnxn extends ServerCnxn {
     }
 
     /**
-     * Handles read/write IO on connection.
+     * 真正处理读写请求
+     * 前提知识：客户端与服务端交流是通过socket方式，传递命令的字节流，其中这些字节流被封装成了一个Package对象，这个对象的开头四字节（int）用来
+     * 表示该Package的长度，首先服务端在读取的是先读取默认4字节长度数据，来获得该次命令的总长度，然后清空缓存；接着读取上一步获得长度len的一个命令
+     * 字节去做处理
      */
     void doIO(SelectionKey k) throws InterruptedException {
         try {
+            // 当前的Socket是否还在连接
             if (isSocketOpen() == false) {
                 LOG.warn("trying to do i/o on a null socket for session:0x"
                          + Long.toHexString(sessionId));
@@ -318,15 +322,18 @@ public class NIOServerCnxn extends ServerCnxn {
                 return;
             }
             if (k.isReadable()) {
-                int rc = sock.read(incomingBuffer);
+                // 读就绪，把数据读到incomingBuffer中，incomingBuffer一开始默认大小事4字节
+                int rc = sock.read(incomingBuffer); // 读取4个字节，存放到incomingBuffer中，该package的前4个字节是用来记录文件大小
                 if (rc < 0) {
                     throw new EndOfStreamException(
                             "Unable to read additional data from client sessionid 0x"
                             + Long.toHexString(sessionId)
                             + ", likely client has closed socket");
                 }
+                // 判断还有没有空间来读数据，如果缓存里面已经满了，说明所有的数据都已经读到，可以做处理了
                 if (incomingBuffer.remaining() == 0) {
                     boolean isPayload;
+                    // 这一步的作用是清除第一次获取package长度的缓存数据，第一次只是获取其长度，保存在缓存区中的数据是没有用，
                     if (incomingBuffer == lenBuffer) { // start of next request
                         incomingBuffer.flip();
                         isPayload = readLength(k);
@@ -335,6 +342,7 @@ public class NIOServerCnxn extends ServerCnxn {
                         // continuation
                         isPayload = true;
                     }
+                    // 到这里说明已经读取了真正的客户端命令数据，接着执行
                     if (isPayload) { // not the case for 4letterword
                         readPayload();
                     }

@@ -470,8 +470,9 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                     try {
                         // 查询就绪事件
                         select();
+
                         // 这个方法会对AcceptedQueue队列中某个SocketChannel向selector上注册OP_READ事件，
-                        // 只有注册了才能在下一次循环中可以拿到就绪事件
+                        // 只有注册了才能在下一次循环的select方法中才可以拿到就绪事件
                         processAcceptedConnections();
                         processInterestOpsUpdateRequests();
                     } catch (RuntimeException e) {
@@ -504,20 +505,31 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             }
         }
 
+        /**
+         * 在上步processAcceptedConnections() 中会对当前SelectorThread线程的队列里面
+         * 所有的SocketChannel对象进行注册，最后包装成一个SelectionKey对象保存在Set中，
+         * 在该方法中则直接将这些就绪的事件拿出来处理
+         */
         private void select() {
             try {
-                //  这里如果阻塞了，就会导致上一层while一直阻塞，直到事件已经就绪好了才会解阻塞，但是如果selector没有注册任何事件就不会导致阻塞
+                // 这里如果阻塞了，就会导致上一层while一直阻塞，直到事件已经就绪好了才会解阻塞，但是如果selector没有注册任何事件就不会导致阻塞
                 selector.select();
-                // 这里有就绪事件
+
+                // 拿到所有当前SelectorThread里面的就绪事件
                 Set<SelectionKey> selected = selector.selectedKeys();
-                ArrayList<SelectionKey> selectedList =
-                        new ArrayList<SelectionKey>(selected);
+                ArrayList<SelectionKey> selectedList = new ArrayList<SelectionKey>(selected);
+
                 // 这里会打乱就绪事件顺序
                 Collections.shuffle(selectedList);
+
                 // 遍历就绪事件
                 Iterator<SelectionKey> selectedKeys = selectedList.iterator();
+
+                // 如果当前服务端没有被AdminServer关闭 && 下一个就绪事件不为空
                 while (!stopped && selectedKeys.hasNext()) {
                     SelectionKey key = selectedKeys.next();
+
+                    // 事件一旦处理过了，就会从就绪事件集合Set中删除掉
                     selected.remove(key);
 
                     if (!key.isValid()) {
@@ -543,15 +555,17 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
          * I/O is run directly by this thread.
          */
         private void handleIO(SelectionKey key) {
-            IOWorkRequest workRequest = new IOWorkRequest(this, key);
+            // 这一步同时也会初始化一个 NIOServerCnxn
+            IOWorkRequest iOWorkRequest = new IOWorkRequest(this, key);
             NIOServerCnxn cnxn = (NIOServerCnxn) key.attachment();
 
             // Stop selecting this key while processing on its
             // connection
             cnxn.disableSelectable();
             key.interestOps(0);
+            //  在CnxnExpiryQueue中添加和更新NIOServerCnxn，防止过期被清理
             touchCnxn(cnxn);
-            workerPool.schedule(workRequest);
+            workerPool.schedule(iOWorkRequest);
         }
 
         /**
@@ -594,6 +608,8 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     }
 
     /**
+     * Socket上线文，对客户端命令其实是有此类的doWork()来处理的
+     *
      * IOWorkRequest is a small wrapper class to allow doIO() calls to be
      * run on a connection using a WorkerService.
      */
@@ -614,7 +630,10 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 return;
             }
 
+            // 读或写就绪事件都可以触发处理IO操作
             if (key.isReadable() || key.isWritable()) {
+                // 处理key，
+                // 到这里，多个客户端请求还是并发处理的
                 cnxn.doIO(key);
 
                 // Check if we shutdown or doIO() closed this connection
@@ -626,6 +645,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                     selectorThread.cleanupSelectionKey(key);
                     return;
                 }
+                // 由于服务端会清除长时间没有活动的客户端，这一步是来讲当前客户端计时器清零
                 touchCnxn(cnxn);
             }
 
@@ -843,9 +863,9 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     @Override
     public void start() {
         stopped = false;
+        // 这里对线程池做初始化，用来处理IOWorkRequest
         if (workerPool == null) {
-            workerPool = new WorkerService(
-                    "NIOWorker", numWorkerThreads, false);
+            workerPool = new WorkerService("NIOWorker", numWorkerThreads, false);
         }
         for (SelectorThread thread : selectorThreads) {
             if (thread.getState() == Thread.State.NEW) {
@@ -932,6 +952,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     }
 
     /**
+     * 在CnxnExpiryQueue中添加和更新NIOServerCnxn，防止过期被清理
      * Add or update cnxn in our cnxnExpiryQueue
      * @param cnxn
      */

@@ -103,6 +103,7 @@ public class WorkerService {
     }
 
     /**
+     * 具体执行任务方法
      * Schedule work to be done by the thread assigned to this id. Thread
      * assignment is a single mod operation on the number of threads.  If a
      * worker thread pool is not being used, work is done directly by
@@ -113,24 +114,26 @@ public class WorkerService {
             workRequest.cleanup();
             return;
         }
-
-        ScheduledWorkRequest scheduledWorkRequest =
-            new ScheduledWorkRequest(workRequest);
+        // 将 IOWordRequest转化为 ScheduledWorkRequest
+        ScheduledWorkRequest scheduledWorkRequest = new ScheduledWorkRequest(workRequest);
 
         // If we have a worker thread pool, use that; otherwise, do the work
         // directly.
         int size = workers.size();
+        // 线程池集合为空说明没有线程池可用
         if (size > 0) {
             try {
                 // make sure to map negative ids as well to [0, size-1]
                 int workerNum = ((int) (id % size) + size) % size;
                 ExecutorService worker = workers.get(workerNum);
+                // 将包装成scheduledWorkRequest的客户端请求，交给线程池执行
                 worker.execute(scheduledWorkRequest);
             } catch (RejectedExecutionException e) {
                 LOG.warn("ExecutorService rejected execution", e);
                 workRequest.cleanup();
             }
         } else {
+            // 没有线程池直接执行对应run方法
             // When there is no worker thread pool, do the work directly
             // and wait for its completion
             scheduledWorkRequest.run();
@@ -195,16 +198,22 @@ public class WorkerService {
         }
     }
 
+    /**
+     * 初始化一个用来保存线程池的List，来处理 IOWorkRequest，即：就绪的事件
+     */
     public void start() {
         if (numWorkerThreads > 0) {
+            // 工作线程是否应单独分配
             if (threadsAreAssignable) {
+                // 1，初始化一个用来保存线程池的List，类型为线程池List中，线程池里面只有一个线程
                 for(int i = 1; i <= numWorkerThreads; ++i) {
-                    workers.add(Executors.newFixedThreadPool(
-                        1, new DaemonThreadFactory(threadNamePrefix, i)));
+                    // DaemonThreadFactory为后台线程，当该后台线程的前台线程停止后就会立即停止，
+                    // 即Zookeeper服务端停止后其后台的处理SocketChannel线程会立即停止
+                    workers.add(Executors.newFixedThreadPool(1, new DaemonThreadFactory(threadNamePrefix, i)));
                 }
             } else {
-                workers.add(Executors.newFixedThreadPool(
-                    numWorkerThreads, new DaemonThreadFactory(threadNamePrefix)));
+                // 2，初始化保存线程池的List，该List中只有程数为numWorkerThreads的线程池
+                workers.add(Executors.newFixedThreadPool(numWorkerThreads, new DaemonThreadFactory(threadNamePrefix)));
             }
         }
         stopped = false;
