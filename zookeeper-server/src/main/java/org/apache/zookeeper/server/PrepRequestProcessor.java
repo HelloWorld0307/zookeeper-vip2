@@ -121,7 +121,33 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
     }
 
     /**
-     * method for tests to set failCreate
+     * PrepRequestProcessor：
+     * 通常是一个Requestprocessor Chain中的第一个Processor，用来预处理请求。
+     * 主要包括：
+     * 1. 检查ACL，如果不匹配ACL，则直接结束对该请求的处理
+     * 2. 生成并记录ChangeRecord
+     * 3. 设置持久化txn
+     * 4. 调用下一个RequestProcessor
+     *
+     * 通俗一点理解就是，过滤Request，不是所有的Request都是合法的，所以需要对Request进行合法的验证，验证通过后，
+     * 对于Request而言就要进行持久化了，所以PrepRequestProcessor中也为持久化做一下准备，比如生成和Txn和TxnHeader，
+     * 在持久化时直接从Request中获取这两个属性进行持久化就行了。
+     * 另外，Request持久化完成后，就需要更新DataTree了，并且是根据Txn来更新DataTree（根据持久化的信息来更新DataTree）。
+     * 那么，为什么需要ChangeRecord呢？
+     * ChangeRecord表示修改记录，表示某个节点的修改记录，在处理Request时，需要依赖现有节点上的已有信息，
+     * 比如cversion（某个节点的孩子节点版本），比如，在处理一个create请求时，需要修改父节点上的cversion（加1），
+     * 那么这个信息从哪来呢？一开始肯定是从DataTree上来，但是不能每次都从DataTree上来获取父节点的信息，这样性能很慢，
+     * 比如ZooKeeperServer连续收到两个create请求，当某个create请求在被处理时，都需要先从DataTree获取信息，然后持久化，
+     * 然后更新DataTree，最后才能处理下一个create请求，是一个串行的过程，那么如果第二个create不合法呢？依照上面的思路，
+     * 则还需要等待第一个create请求处理完了之后才能对第二个请求进行验证，所以Zookeeper为了解决这个问题，
+     * 在PrepRequestProcessor中，没验证完一个请求，就把这个请求异步的交给持久化线程来处理，PrepRequestProcessor自己
+     * 就去处理下一个请求了，打断了串行的链路，但是这时又出现了问题，因为在处理第二个create请求时需要依赖父节点的信息，
+     * 并且应该处理过第一个create请求后的结果，所以这时就引入了ChangeRecord，PrepRequestProcessor在处理第一个create请求时，
+     * 先生成一条ChangeRecord记录，然后再异步的去持久化和更新DataTree，然后立即去处理第二个create请求，
+     * 此时就可以不需要去取DataTree中的信息了（就算取了，可能取到的信息也不对），就直接取ChangeRecord中的信息就可以了。
+     *
+     * 问题一：cversion是什么时候去ChangeRecord中拿，什么是从DataTree中拿？
+     * 答：先去ChangeRecord中拿，如果没拿到说明之前对这个节点没有处理过，拿到了直接只用拿到的信息。
      * @param b
      */
     public static void setFailCreate(boolean b) {
@@ -131,7 +157,9 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
     public void run() {
         try {
             while (true) {
+                // PrepRequestProcessor 从队列中拿到一个Request请求对象
                 Request request = submittedRequests.take();
+                // 下面是日志打印逻辑
                 long traceMask = ZooTrace.CLIENT_REQUEST_TRACE_MASK;
                 if (request.type == OpCode.ping) {
                     traceMask = ZooTrace.CLIENT_PING_TRACE_MASK;
@@ -139,9 +167,11 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
                 if (LOG.isTraceEnabled()) {
                     ZooTrace.logRequest(LOG, traceMask, 'P', request, "");
                 }
+                // 这里是对一个线程shutdown的优雅方法，如果线程为某种状态后直接break掉即可。
                 if (Request.requestOfDeath == request) {
                     break;
                 }
+                // 处理请求
                 pRequest(request);
             }
         } catch (RequestProcessorException e) {
@@ -155,9 +185,17 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
         LOG.info("PrepRequestProcessor exited loop!");
     }
 
+    /**
+     * 此方法可以用来解决多线程环境下cversion不一致问题
+     *
+     * @param path
+     * @return
+     * @throws KeeperException.NoNodeException
+     */
     private ChangeRecord getRecordForPath(String path) throws KeeperException.NoNodeException {
         ChangeRecord lastChange = null;
         synchronized (zks.outstandingChanges) {
+            // 从一个Map<String, ChangeRecord>类型的集合中找是否有当前节点信息，有说明已经之前修改过了，直接使用；没有去DataTree中拿
             lastChange = zks.outstandingChangesForPath.get(path);
             if (lastChange == null) {
                 DataNode n = zks.getZKDatabase().getNode(path);
@@ -346,6 +384,7 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
     }
 
     /**
+     * 持久化当前操作
      * This method will be called inside the ProcessRequestThread, which is a
      * singleton, so there will be a single thread calling this code.
      *
@@ -358,6 +397,7 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
                                 Record record, boolean deserialize)
         throws KeeperException, IOException, RequestProcessorException
     {
+        // 设置日志头，具体参数：sessionID，cxid，zxid，当前时间，请求类型
         request.setHdr(new TxnHeader(request.sessionId, request.cxid, zxid,
                 Time.currentWallTime(), type));
 
@@ -366,6 +406,7 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
             case OpCode.create2:
             case OpCode.createTTL:
             case OpCode.createContainer: {
+                // record为日志体
                 pRequest2TxnCreate(type, request, record, deserialize);
                 break;
             }
@@ -628,6 +669,8 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
 
     private void pRequest2TxnCreate(int type, Request request, Record record, boolean deserialize) throws IOException, KeeperException {
         if (deserialize) {
+            // request.request为一个ByteBuffer类型的
+            // 把Request请求对象中的内容反序列化到record中，后面会把record持久化
             ByteBufferInputStream.byteBuffer2Record(request.request, record);
         }
 
@@ -651,15 +694,26 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
             data = createRequest.getData();
             ttl = -1;
         }
+        // 七种节点类型CreateMode.PERSISTENT;
+        //        CreateMode.EPHEMERAL;
+        //        CreateMode.PERSISTENT_SEQUENTIAL;
+        //        CreateMode.EPHEMERAL_SEQUENTIAL ;
+        //        CreateMode.CONTAINER;
+        //        CreateMode.PERSISTENT_WITH_TTL;
+        //        CreateMode.PERSISTENT_SEQUENTIAL_WITH_TTL;
         CreateMode createMode = CreateMode.fromFlag(flags);
+        // 如果为ttl节点，必须服务端必须开启支持ttl
         validateCreateRequest(path, createMode, request, ttl);
+        // 当前节点的父节点
         String parentPath = validatePathForCreate(path, request.sessionId);
 
         List<ACL> listACL = fixupACL(path, request.authInfo, acl);
+        // 拿到父节点的ChangeRecord，现在是创建一个节点，所以父节点上的属性也需要修改
         ChangeRecord parentRecord = getRecordForPath(parentPath);
 
         checkACL(zks, parentRecord.acl, ZooDefs.Perms.CREATE, request.authInfo);
         int parentCVersion = parentRecord.stat.getCversion();
+        // 如果创建的是顺序节点，需要给节点拼接一个递增的10位数字后缀
         if (createMode.isSequential()) {
             path = path + String.format(Locale.ENGLISH, "%010d", parentCVersion);
         }
@@ -671,14 +725,17 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
         } catch (KeeperException.NoNodeException e) {
             // ignore this one
         }
+        // 如果父节点为临时节点，则不能添加子节点，然后直接返回异常信息
         boolean ephemeralParent = EphemeralType.get(parentRecord.stat.getEphemeralOwner()) == EphemeralType.NORMAL;
         if (ephemeralParent) {
             throw new KeeperException.NoChildrenForEphemeralsException(path);
         }
+        // 父节点新增一个节点后其cversion要加一
         int newCversion = parentRecord.stat.getCversion()+1;
-        if (type == OpCode.createContainer) {
+        // 根据不同节点类型记录日志
+        if (type == OpCode.createContainer) { // 容器类型
             request.setTxn(new CreateContainerTxn(path, data, listACL, newCversion));
-        } else if (type == OpCode.createTTL) {
+        } else if (type == OpCode.createTTL) { // ttl类型
             request.setTxn(new CreateTTLTxn(path, data, listACL, newCversion, ttl));
         } else {
             request.setTxn(new CreateTxn(path, data, listACL, createMode.isEphemeral(),
@@ -732,15 +789,24 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
     protected void pRequest(Request request) throws RequestProcessorException {
         // LOG.info("Prep>>> cxid = " + request.cxid + " type = " +
         // request.type + " id = 0x" + Long.toHexString(request.sessionId));
-        request.setHdr(null);
-        request.setTxn(null);
+        //清空 日志头和日志内容，下面会重新赋值
+        request.setHdr(null); // 日志头
+        request.setTxn(null); // 日志体
 
         try {
+            // 判断不同操作类型
             switch (request.type) {
+                // 只有数据操作命令才会调用pRequest2Txn方法记录日志，读命令不需要
             case OpCode.createContainer:
             case OpCode.create:
             case OpCode.create2:
+                // 这里new出来的这个对象，只在pRequest2Txn方法中用了，该对象是Record的实现来，表示日志体
                 CreateRequest create2Request = new CreateRequest();
+                // 记录日志
+                // 注意这里先调用zks.getNextZxid() 获取下一个zxid（自增）
+                // request对象是Record的子类，该方法内将request赋值给，zxid是一个自增的，为了保证唯一性，每次zookeeper服务器启动的时候都会去
+                // 持久化文件中找到最大的zxid作为起始值
+                // create2Request 一个空的日志体
                 pRequest2Txn(request.type, zks.getNextZxid(), request, create2Request, true);
                 break;
             case OpCode.createTTL:
@@ -901,7 +967,10 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
                 request.setTxn(new ErrorTxn(Code.MARSHALLINGERROR.intValue()));
             }
         }
+        // 生成一个新的id
         request.zxid = zks.getZxid();
+        // 这里的nextProcessor其实是在setupRequestProcessors方法初始化中完成的赋值，即为SynchRequestProcessor对象
+        // PreRequestProcessor处理完，将request存放到SynchRequestProcessor内部队列中
         nextProcessor.processRequest(request);
     }
 
@@ -999,6 +1068,7 @@ public class PrepRequestProcessor extends ZooKeeperCriticalThread implements
         return rv;
     }
 
+    // submittedRequests为一个PreRequestProcessor内部队列，SyncRequestProcessor
     public void processRequest(Request request) {
         submittedRequests.add(request);
     }

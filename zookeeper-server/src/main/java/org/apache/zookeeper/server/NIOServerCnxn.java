@@ -52,6 +52,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
+ * ServerCnxn 代表了一个客户端与一个server的连接,其有两种实现,分别是 NIOServerCnxn和 NettyServerCnxn.
+ * 当 SocketChannel 上有数据后就会调用 NIOServerCnxn 上 doIO 方法处理，NIOServerCnxn不负责处理请求，
+ * 只是对请求做一些轻微校验，这里会去调用zkServer去处理数据
+ *
+ * NIOServerCnxn是怎么读取SocketChannel上的数据呢？
+ *  1）数据的粘包拆包
+ *     处理事件比较麻烦的问题就是通过TCP发送的报文会出现粘包和拆包问题，Zookeeper为了解决此问题，在设计通信协议的时候将报文分为3部分
+ *     1，请求头和请求题的长度（4字节）
+ *     2，请求头
+ *     3，请求体
+ *     注:(1)请求头和请求体也细分为更小的部分,但在此不做深入研究,只需知道请求的前4个字节是请求头和请求体的长度即可.
+ *        (2)将请求头和请求体称之为payload在报文头增加了4个字节的长度字段,表示整个报文除长度字段之外的长度.服务端
+ *        可根据该长度将粘包拆包的报文分离或组合为完整的报文.NIOServerCnxn读取数据流程如下:
+ *          1，NIOServerCnxn中有两个属性,一个是lenBuffer,容量为4个字节,用于读取长度信息.一个是incomingBuffer,
+ *          其初始化时即为lenBuffer,但是读取长度信息后,就为incomingBuffer分配对应的空间用于读取payload
+ *          2，根据请求报文的长度分配incomingBuffer的大小
+ *          3，将读到的字节存放在incomingBuffer中,直至读满(由于第2步中为incomingBuffer分配的长度刚好是报文的长度,此时incomingBuffer中刚好时一个报文)
+ *          4，处理报文
+ * 处理步骤如下：
+ *
  * This class handles communication with clients using NIO. There is one per
  * client, but only one thread doing the communication.
  */
@@ -77,6 +97,7 @@ public class NIOServerCnxn extends ServerCnxn {
 
     private int sessionTimeout;
 
+    // 整个系统只有一个zkServer，这里的zkServer只是表示为NIOServerCnxn内部的一个属性，所有客户端的NIOServerCnxn都是公用的同一个zkServer
     private final ZooKeeperServer zkServer;
 
     /**
@@ -161,8 +182,22 @@ public class NIOServerCnxn extends ServerCnxn {
     }
 
     /** Read the request payload (everything following the length prefix) */
+
+    /**
+     * 有两种情况会调用此方法:
+     *      * 1.根据lengthBuffer的值为incomingBuffer分配空间后,此时尚未将数据从socketChannel读取至incomingBuffer中
+     *      * 2.已经将数据从socketChannel中读取至incomingBuffer,且读取完毕
+     *
+     * @throws IOException
+     * @throws InterruptedException
+     */
     private void readPayload() throws IOException, InterruptedException {
+        // incomingBuffer 大小就是package大小，多以判断incomingBuffer是否为空可以知道数据有没有读完
         if (incomingBuffer.remaining() != 0) { // have we read length bytes?
+            //对应情况1,此时刚为incomingBuffer分配空间,incomingBuffer为空,进行一次数据读取
+            //(1)若将incomingBuffer读满,则直接进行处理;
+            //(2)若未将incomingBuffer读满,则说明此次发送的数据不能构成一个完整的请求,则等待下一次数据到达后调用doIo()时再次将数据
+            //从socketChannel读取至incomingBuffer
             int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
             if (rc < 0) {
                 throw new EndOfStreamException(
@@ -172,12 +207,15 @@ public class NIOServerCnxn extends ServerCnxn {
             }
         }
 
-        if (incomingBuffer.remaining() == 0) { // have we read length bytes?
+        if (incomingBuffer.remaining() == 0) {
             packetReceived();
             incomingBuffer.flip();
+            // 是否初始化好了
             if (!initialized) {
+                // socket连接建立好了，但是还没有初始化，处理connectRequest
                 readConnectRequest();
             } else {
+                // ***** 通过调用zkServer去处理增删改查请求 *****
                 readRequest();
             }
             lenBuffer.clear();
@@ -307,13 +345,21 @@ public class NIOServerCnxn extends ServerCnxn {
     }
 
     /**
-     * 真正处理读写请求
+     * 处理读写请求
      * 前提知识：客户端与服务端交流是通过socket方式，传递命令的字节流，其中这些字节流被封装成了一个Package对象，这个对象的开头四字节（int）用来
-     * 表示该Package的长度，首先服务端在读取的是先读取默认4字节长度数据，来获得该次命令的总长度，然后清空缓存；接着读取上一步获得长度len的一个命令
-     * 字节去做处理
+     * 表示该Package的长度，首先服务端是先读取默认4字节长度数据，来获得该次命令的总长度，然后清空缓存；接着读取package数据执行命令
      */
     void doIO(SelectionKey k) throws InterruptedException {
         try {
+            /*
+                处理读操作的流程
+                1.最开始incomingBuffer就是lenBuffer,容量为4.第一次读取4个字节,即此次请求报文的长度
+                2.根据请求报文的长度分配incomingBuffer的大小
+                3.将读到的字节存放在incomingBuffer中,直至读满
+                 (由于第2步中为incomingBuffer分配的长度刚好是报文的长度,此时incomingBuffer中刚好时一个报文)
+                4.处理报文
+            */
+
             // 当前的Socket是否还在连接
             if (isSocketOpen() == false) {
                 LOG.warn("trying to do i/o on a null socket for session:0x"
@@ -330,12 +376,22 @@ public class NIOServerCnxn extends ServerCnxn {
                             + Long.toHexString(sessionId)
                             + ", likely client has closed socket");
                 }
-                // 判断还有没有空间来读数据，如果缓存里面已经满了，说明所有的数据都已经读到，可以做处理了
+                /*
+                    只有incomingBuffer.remaining() == 0,才会进行下一步的处理,否则一直读取数据直到incomingBuffer读满,此时有两种可能:
+                    1.incomingBuffer就是lenBuffer,此时incomingBuffer的内容是此次请求报文的长度.
+                     根据lenBuffer为incomingBuffer分配空间后调用readPayload().
+                     在readPayload()中会立马进行一次数据读取,(1)若可以将incomingBuffer读满,则incomingBuffer中就是一个完整的请求,处理该请求;
+                     (2)若不能将incomingBuffer读满,说明出现了拆包问题,此时不能构造一个完整的请求,只能等待客户端继续发送数据,
+                     等到下次socketChannel可读时,继续将数据读取到incomingBuffer中
+                    2.incomingBuffer不是lenBuffer,说明上次读取时出现了拆包问题,incomingBuffer中只有一个请求的部分数据.
+                    而这次读取的数据加上上次读取的数据凑成了一个完整的请求,调用readPayload()
+                 */
                 if (incomingBuffer.remaining() == 0) {
                     boolean isPayload;
                     // 这一步的作用是清除第一次获取package长度的缓存数据，第一次只是获取其长度，保存在缓存区中的数据是没有用，
                     if (incomingBuffer == lenBuffer) { // start of next request
                         incomingBuffer.flip();
+                        // isPayload = false表示为第一次读取package前面的4字节，需要重新继续读
                         isPayload = readLength(k);
                         incomingBuffer.clear();
                     } else {
@@ -344,6 +400,7 @@ public class NIOServerCnxn extends ServerCnxn {
                     }
                     // 到这里说明已经读取了真正的客户端命令数据，接着执行
                     if (isPayload) { // not the case for 4letterword
+                        // 读取客户端命令Package，并调用zkServer执行命令
                         readPayload();
                     }
                     else {
@@ -384,6 +441,9 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
+    /**
+     * NIOServerCnxn不负责处理请求，只是对请求做一些轻微校验，这里会去调用zkServer去处理数据。
+     */
     private void readRequest() throws IOException {
         zkServer.processPacket(this, incomingBuffer);
     }
@@ -399,6 +459,7 @@ public class NIOServerCnxn extends ServerCnxn {
                     LOG.debug("Throttling recv " + inProcess);
                 }
                 disableRecv();
+
             }
         }
     }
@@ -544,8 +605,8 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    /** Reads the first 4 bytes of lenBuffer, which could be true length or
-     *  four letter word.
+    /**
+     *  功能：根据读取到的package包前4位预留字段具体数值，在系统中重新开辟一个package自身大小的缓存，供下面步骤读取具体package数据
      *
      * @param k selection key
      * @return true if length read, otw false (wasn't really the length)
@@ -554,6 +615,7 @@ public class NIOServerCnxn extends ServerCnxn {
     private boolean readLength(SelectionKey k) throws IOException {
         // Read the length, now get the buffer
         int len = lenBuffer.getInt();
+        // 判断是否为第一次读取数据 && 是否为4字节长度--因为package的前4个字节是预留字段表示package数据整体长度，所以第一次读取是一个package数据包长度值
         if (!initialized && checkFourLetterWord(sk, len)) {
             return false;
         }
@@ -563,6 +625,7 @@ public class NIOServerCnxn extends ServerCnxn {
         if (!isZKServerRunning()) {
             throw new IOException("ZooKeeperServer not running");
         }
+        // 当前 len 为package具体长度，根据此len开辟一个具体缓冲区
         incomingBuffer = ByteBuffer.allocate(len);
         return true;
     }

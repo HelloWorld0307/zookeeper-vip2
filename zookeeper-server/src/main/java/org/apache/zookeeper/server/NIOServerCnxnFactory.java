@@ -471,8 +471,9 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                         // 查询就绪事件
                         select();
 
-                        // 这个方法会对AcceptedQueue队列中某个SocketChannel向selector上注册OP_READ事件，
-                        // 只有注册了才能在下一次循环的select方法中才可以拿到就绪事件
+                        // 1，这个方法会对AcceptedQueue队列中某个SocketChannel向selector上注册OP_READ事件，
+                        //    只有注册了才能在下一次循环的select方法中才可以拿到就绪事件。
+                        // 2，初始化一个NIOServerCnxn，因为对客户端命令的执行就是通过NIOServerCnxn里面的doIO来完成的
                         processAcceptedConnections();
                         processInterestOpsUpdateRequests();
                     } catch (RuntimeException e) {
@@ -577,8 +578,11 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             while (!stopped && (accepted = acceptedQueue.poll()) != null) {
                 SelectionKey key = null;
                 try {
+                    // 1，注册可读事件
                     key = accepted.register(selector, SelectionKey.OP_READ);
+                    // 2，新建一个NIOServerCnxn
                     NIOServerCnxn cnxn = createConnection(accepted, key, this);
+                    // 3，为当前客户端socket连接刷新，防止过期
                     key.attach(cnxn);
                     addCnxn(cnxn);
                 } catch (IOException e) {
@@ -904,7 +908,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             // 2,初始化requestPrecessChain-请求处理器链-如果某个节点只有一部分权限acdwr，就在RequestPrecessChain里面做的判断
             // 3,创建RequestThrottle
             // 4,注册jmx
-            // 5,修改RUNNING状态
+            // 5,修改服务端为RUNNING状态
             // 6,NotifyAll，上面步骤中会启动一些线程，这些线程在运行过程中如果发现一写其他的前置条件还没有满足，则去执行前置条件
             zks.startup();
         }

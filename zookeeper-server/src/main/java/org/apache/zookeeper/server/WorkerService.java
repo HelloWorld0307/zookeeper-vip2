@@ -205,14 +205,14 @@ public class WorkerService {
         if (numWorkerThreads > 0) {
             // 工作线程是否应单独分配
             if (threadsAreAssignable) {
-                // 1，初始化一个用来保存线程池的List，类型为线程池List中，线程池里面只有一个线程
+                // 1，初始化一个用来保存线程池的List，类型为线程池List中，每个线程池元素里只有一个线程
                 for(int i = 1; i <= numWorkerThreads; ++i) {
                     // DaemonThreadFactory为后台线程，当该后台线程的前台线程停止后就会立即停止，
                     // 即Zookeeper服务端停止后其后台的处理SocketChannel线程会立即停止
                     workers.add(Executors.newFixedThreadPool(1, new DaemonThreadFactory(threadNamePrefix, i)));
                 }
             } else {
-                // 2，初始化保存线程池的List，该List中只有程数为numWorkerThreads的线程池
+                // 2，初始化保存线程池的List，该List中只有线程数为numWorkerThreads的一个线程池
                 workers.add(Executors.newFixedThreadPool(numWorkerThreads, new DaemonThreadFactory(threadNamePrefix)));
             }
         }

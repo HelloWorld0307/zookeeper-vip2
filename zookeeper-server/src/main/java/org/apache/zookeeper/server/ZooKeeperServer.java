@@ -151,7 +151,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      * Creates a ZooKeeperServer instance. It sets everything up, but doesn't
      * actually start listening for clients until run() is invoked.
      *
-     * @param dataDir the directory to put the data
      */
     public ZooKeeperServer(FileTxnSnapLog txnLogFactory, int tickTime,
             int minSessionTimeout, int maxSessionTimeout, ZKDatabase zkDb) {
@@ -454,22 +453,35 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     public synchronized void startup() {
+
+        // sessionTracker 是一个线程，用来关闭过期session
         if (sessionTracker == null) {
             createSessionTracker();
         }
         startSessionTracker();
+
+        // 设置 RequestProcessor Chain
         setupRequestProcessors();
 
         registerJMX();
 
+        // 设置服务器为RUNNING状态，然后唤醒所有等待线程
         setState(State.RUNNING);
         notifyAll();
     }
 
+    /**
+     * 初始化RequestProcessor Chain，其中PrepRequestProcessor和SyncRequestProcessor是一个线程，
+     * 初始化步骤：
+     *    1）实例化一个FinalRequestProcessor对象，
+     *    2）实例化SyncRequestProcessor线程，将FinalRequestProcessor做为参数传入到SyncRequestProcessor中
+     *    3）启动SyncRequestProcessor 线程
+     *    4）实例化PrepRequestProcessor线程，将启动SyncRequestProcessor对象作为参数传入到PrepRequestProcessor中
+     */
     protected void setupRequestProcessors() {
         RequestProcessor finalProcessor = new FinalRequestProcessor(this);
-        RequestProcessor syncProcessor = new SyncRequestProcessor(this,
-                finalProcessor);
+        RequestProcessor syncProcessor = new SyncRequestProcessor(this, finalProcessor);
+        // 启动之后就会从队列中那任务处理
         ((SyncRequestProcessor)syncProcessor).start();
         firstProcessor = new PrepRequestProcessor(this, syncProcessor);
         ((PrepRequestProcessor)firstProcessor).start();
@@ -793,7 +805,20 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     protected void setLocalSessionFlag(Request si) {
     }
 
+    /**
+     * 这里涉及到一个zookeeper很重要的模型，线程加队列，由于在处理后一个请求的过程中还涉及到了很其他附加操作，
+     * 例如：验证ACL，命令持久化，日志记录，触发Watch和打快照，如果其中某个操作阻塞了，
+     * 那么整个客户端请求处理效率就会很慢，为了提升效率Zookeeper通过一个责任链将附加操作拆分开来分为三部分，
+     * PreRequestProcessor, SyncRequestProcessor, finalRequestProcessor前两个处理方法内部有队列，
+     * 这样当某个方法处理完毕后直接放入到后面对象内部队列后就可以继续接受新的请求了
+     *
+     * PreRequestProcessor什么时候初始化的？
+     * 在ZookeeperServer 的startup方法执行的时候。
+     *
+     * @param si 请求的Request对象
+     */
     public void submitRequest(Request si) {
+        // 判断处理链表中的 PrepRequestProcessor 有没有初始化成功，成功直接执行里面的processRequest方法
         if (firstProcessor == null) {
             synchronized (this) {
                 try {
@@ -801,6 +826,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                     // processor it should wait for setting up the request
                     // processor chain. The state will be updated to RUNNING
                     // after the setup.
+                    // 根据标志位判断是否为RUNNING，如果不是则等到1000微秒，一直等到PrepRequestProcessor创建成功
                     while (state == State.INITIAL) {
                         wait(1000);
                     }
@@ -816,6 +842,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             touch(si.cnxn);
             boolean validpacket = Request.isValid(si.type);
             if (validpacket) {
+                // Request对象存入到PreRequestProcessor内部的 LinkedBlockingQueue<Request> submittedRequests队列中，
+                // 这样PreRequestProcessor线程启动后，其run方法才可以去处理Request请求
                 firstProcessor.processRequest(si);
                 if (si.cnxn != null) {
                     incInProcess();
@@ -1083,17 +1111,27 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return false;
     }
 
+    /**
+     * 处理命令
+     * @param cnxn socket连接
+     * @param incomingBuffer 从客户端读取到的数据
+     * @throws IOException
+     */
     public void processPacket(ServerCnxn cnxn, ByteBuffer incomingBuffer) throws IOException {
         // We have the request, now process and setup for next
         InputStream bais = new ByteBufferInputStream(incomingBuffer);
         BinaryInputArchive bia = BinaryInputArchive.getArchive(bais);
+        // 请求头对象，里面有请求的具体信息，例如：type表示此命令为增删改查操作
         RequestHeader h = new RequestHeader();
+        // 做一些反序列化
         h.deserialize(bia, "header");
         // Through the magic of byte buffers, txn will not be
         // pointing
         // to the start of the txn
         incomingBuffer = incomingBuffer.slice();
+        // todo  ----没弄明白
         if (h.getType() == OpCode.auth) {
+            // 处理addAuth命令，把auth信息添加到ServerCnxn中
             LOG.info("got auth packet " + cnxn.getRemoteSocketAddress());
             AuthPacket authPacket = new AuthPacket();
             ByteBufferInputStream.byteBuffer2Record(incomingBuffer, authPacket);
@@ -1140,13 +1178,14 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                 cnxn.sendResponse(rh,rsp, "response"); // not sure about 3rd arg..what is it?
                 return;
             }
-            else {
+            else {  // 增删改查操作执行逻辑
                 Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
                   h.getType(), incomingBuffer, cnxn.getAuthInfo());
                 si.setOwner(ServerCnxn.me);
                 // Always treat packet from the client as a possible
                 // local request.
                 setLocalSessionFlag(si);
+                // 当前线程将最终的请求放入到一个队列，然后就可以处理其他请求了，这个请求就由其他线程处理
                 submitRequest(si);
             }
         }
