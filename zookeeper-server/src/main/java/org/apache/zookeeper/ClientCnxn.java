@@ -127,6 +127,7 @@ public class ClientCnxn {
 
     /**
      * These are the packets that have been sent and are waiting for a response.
+     * 服务端返回的响应都存放在pendingQueue中
      */
     private final LinkedList<Packet> pendingQueue = new LinkedList<Packet>();
 
@@ -395,7 +396,9 @@ public class ClientCnxn {
         this.hostProvider = hostProvider;
         this.chrootPath = chrootPath;
 
+        // 设置客户端与服务端最大等待连接时间
         connectTimeout = sessionTimeout / hostProvider.size();
+        // 最大等待服务端响应时间
         readTimeout = sessionTimeout * 2 / 3;
         readOnly = canBeReadOnly;
 
@@ -405,6 +408,8 @@ public class ClientCnxn {
         initRequestTimeout();
     }
 
+    // 启动SendThread 来建立连接，发送和接收数据
+    // 启动EventThread 来异步的返回值
     public void start() {
         sendThread.start();
         eventThread.start();
@@ -711,13 +716,18 @@ public class ClientCnxn {
             }
         }
 
+        // 重点，一个数据处理完毕后，如果没有配置异步回调函数，则直接notifyAll
         if (p.cb == null) {
             synchronized (p) {
                 p.finished = true;
                 p.notifyAll();
             }
         } else {
+            // 如果有异步，则吧packet添加到eventThread线程中管理的waitingEvents里面
+            // 这时没有notify
+            // 相当于客户端在请求服务端时，如果提供了AsyncCallback，就表示异步调用，如果没有就是同步调用，p.finished直接设置为true
             p.finished = true;
+            // 数据进入到队列中waitingEvents
             eventThread.queuePacket(p);
         }
     }
@@ -808,6 +818,12 @@ public class ClientCnxn {
         private Random r = new Random();
         private boolean isFirstConnect = true;
 
+        /**
+         * SendThread 功能之一 读取服务端响数据
+         *
+         * @param incomingBuffer 数据缓存流
+         * @throws IOException
+         */
         void readResponse(ByteBuffer incomingBuffer) throws IOException {
             ByteBufferInputStream bbis = new ByteBufferInputStream(
                     incomingBuffer);
@@ -897,6 +913,8 @@ public class ClientCnxn {
              * to the first request!
              */
             try {
+                // 如果客户端当前读取到的数据xid和pendingQueue中的第一个packet的xid不一致，表明有问题
+                // 正常情况下，客户端向服务端发送的命令，服务端要保证串行执行这些命令，保证顺序性
                 if (packet.requestHeader.getXid() != replyHdr.getXid()) {
                     packet.replyHeader.setErr(
                             KeeperException.Code.CONNECTIONLOSS.intValue());
@@ -909,12 +927,15 @@ public class ClientCnxn {
                             + packet );
                 }
 
+                // 正常情况下将读取的响应值设置到replyHeader中
                 packet.replyHeader.setXid(replyHdr.getXid());
                 packet.replyHeader.setErr(replyHdr.getErr());
                 packet.replyHeader.setZxid(replyHdr.getZxid());
+                // 客户端记录一下当前zk服务端最新的zxid
                 if (replyHdr.getZxid() > 0) {
                     lastZxid = replyHdr.getZxid();
                 }
+                // 响应体
                 if (packet.response != null && replyHdr.getErr() == 0) {
                     packet.response.deserialize(bbia, "response");
                 }
@@ -924,6 +945,7 @@ public class ClientCnxn {
                             + Long.toHexString(sessionId) + ", packet:: " + packet);
                 }
             } finally {
+                // packet进入到队列，以及唤醒等待服务端响应的等待线程
                 finishPacket(packet);
             }
         }
@@ -961,6 +983,9 @@ public class ClientCnxn {
                     clientCnxnSocket.getRemoteSocketAddress());
             isFirstConnect = false;
             long sessId = (seenRwServerBefore) ? sessionId : 0;
+            // 客户端连接服务端时会发送一个ConnectRequest请求，会创建SessionImpl对象，并且把SessionImpl对象放入sessionsById中（sessionById是一个Map），
+            // 并且会把Session的过期时间更新到sessionExpiryQueue中，然后会在服务端内部构造一个OpCode.createSession的Request，
+            // 该Request会依次经过PrepRequestProcessor、SyncRequestProcessor、FinalRequestProcessor。
             ConnectRequest conReq = new ConnectRequest(0, lastZxid,
                     sessionTimeout, sessId, sessionPasswd);
             // We add backwards since we are pushing into the front
@@ -1022,6 +1047,7 @@ public class ClientCnxn {
             }
             outgoingQueue.addFirst(new Packet(null, null, conReq,
                     null, null, readOnly));
+            // 上面已经注册了连接事件，这里注册一个读写事件，就可以读和发数据，在doTransport方法就可以使用了
             clientCnxnSocket.connectionPrimed();
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Session establishment request sent on "
@@ -1101,6 +1127,7 @@ public class ClientCnxn {
             }
             logStartConnect(addr);
 
+            // 建立连接
             clientCnxnSocket.connect(addr);
         }
 
@@ -1114,8 +1141,13 @@ public class ClientCnxn {
 
         private static final String RETRY_CONN_MSG =
             ", closing socket connection and attempting reconnect";
+
+        /**
+         * 客户端连接初始化步骤
+         */
         @Override
         public void run() {
+            // outgoingQueue 用来保存各种操作产生的Packet，队列中的数据有sendThread来使用
             clientCnxnSocket.introduce(this, sessionId, outgoingQueue);
             clientCnxnSocket.updateNow();
             clientCnxnSocket.updateLastSendAndHeard();
@@ -1123,8 +1155,10 @@ public class ClientCnxn {
             long lastPingRwServer = Time.currentElapsedTime();
             final int MAX_SEND_PING_INTERVAL = 10000; //10 seconds
             InetSocketAddress serverAddress = null;
+            // stat是ClientCnxn的一个属性，表示： 不是关闭的或者向服务器验证失败的就是存活状态，就算是还没有建立连接也是存活状态的
             while (state.isAlive()) {
                 try {
+                    // clientCnxnSocket是表示socket是连接状态
                     if (!clientCnxnSocket.isConnected()) {
                         // don't re-establish connection if we are closing
                         if (closing) {
@@ -1134,12 +1168,18 @@ public class ClientCnxn {
                             serverAddress = rwServerAddress;
                             rwServerAddress = null;
                         } else {
+                            // 如果连接超时，将会往去连接下一个服务器，如果只有单机则继续连接当前服务端
                             serverAddress = hostProvider.next(1000);
                         }
+                        // 建立连接
+                        // 1，建立socket连接
+                        // 2，连接初始化，primeConnection
+                        // 3，这里没有发送任何数据，只是可能把socket连接建立好
                         startConnect(serverAddress);
                         clientCnxnSocket.updateLastSendAndHeard();
                     }
 
+                    // 判断是否建立连接
                     if (state.isConnected()) {
                         // determine whether we need to send an AuthFailed event.
                         if (zooKeeperSaslClient != null) {
@@ -1177,9 +1217,11 @@ public class ClientCnxn {
                         }
                         to = readTimeout - clientCnxnSocket.getIdleRecv();
                     } else {
+                        // 如果没有连接成功，判断有没有连接超时
                         to = connectTimeout - clientCnxnSocket.getIdleRecv();
                     }
-                    
+
+                    // 连接服务端超时后抛出异常，有catch捕获，清空说数据，重新进入while循环中去监听连接状况
                     if (to <= 0) {
                         String warnInfo;
                         warnInfo = "Client session timed out, have not heard from server in "
@@ -1207,6 +1249,7 @@ public class ClientCnxn {
                     }
 
                     // If we are in read-only mode, seek for read/write server
+                    // 给服务端发送ping心跳，确保连接正常
                     if (state == States.CONNECTEDREADONLY) {
                         long now = Time.currentElapsedTime();
                         int idlePingRwServer = (int) (now - lastPingRwServer);
@@ -1220,6 +1263,7 @@ public class ClientCnxn {
                         to = Math.min(to, pingRwTimeout - idlePingRwServer);
                     }
 
+                    // 查询就绪事件，连接事件
                     clientCnxnSocket.doTransport(to, pendingQueue, ClientCnxn.this);
                 } catch (Throwable e) {
                     if (closing) {
@@ -1517,9 +1561,11 @@ public class ClientCnxn {
             WatchDeregistration watchDeregistration)
             throws InterruptedException {
         ReplyHeader r = new ReplyHeader();
+        // 根据请求信息new一个packet，同时将数据包加入到outgoingQueue队列中
         Packet packet = queuePacket(h, r, request, response, null, null, null,
                 null, watchRegistration, watchDeregistration);
         synchronized (packet) {
+            // 当上一步的packet添加到队列后，这里主线程就会阻塞，一直等到有数据返回才会唤醒主线程
             if (requestTimeout > 0) {
                 // Wait for request completion with timeout
                 waitForPacketFinish(r, packet);
@@ -1541,9 +1587,13 @@ public class ClientCnxn {
      */
     private void waitForPacketFinish(ReplyHeader r, Packet packet)
             throws InterruptedException {
+        // 请求数据包packet已经发送出去了，等待结果
         long waitStartTime = Time.currentElapsedTime();
+        // 还没有处理完成
         while (!packet.finished) {
+            // 等待一个requesttimeout时间
             packet.wait(requestTimeout);
+            // 等待完成这个时间后，如果请求还没有处理完，再看等待事件是否超过了requestTime，超时则break和将响应头里面设置一个错误
             if (!packet.finished && ((Time.currentElapsedTime()
                     - waitStartTime) >= requestTimeout)) {
                 LOG.error("Timeout error occurred for the packet '{}'.",
@@ -1582,6 +1632,22 @@ public class ClientCnxn {
                 ctx, watchRegistration, null);
     }
 
+    /**
+     * 异步的方式获取数据
+     * 与同步方式的区别是：异步将请求的packet直接放入到outgoingQueue中这就直接去执行其他的请求了，不会有阻塞逻辑。
+     *
+     * @param h
+     * @param r
+     * @param request
+     * @param response
+     * @param cb
+     * @param clientPath
+     * @param serverPath
+     * @param ctx
+     * @param watchRegistration
+     * @param watchDeregistration
+     * @return
+     */
     public Packet queuePacket(RequestHeader h, ReplyHeader r, Record request,
             Record response, AsyncCallback cb, String clientPath,
             String serverPath, Object ctx, WatchRegistration watchRegistration,
@@ -1591,6 +1657,8 @@ public class ClientCnxn {
         // Note that we do not generate the Xid for the packet yet. It is
         // generated later at send-time, by an implementation of ClientCnxnSocket::doIO(),
         // where the packet is actually sent.
+
+        // h，request，response都是new出来的
         packet = new Packet(h, r, request, response, watchRegistration);
         packet.cb = cb;
         packet.ctx = ctx;
@@ -1610,9 +1678,11 @@ public class ClientCnxn {
                 if (h.getType() == OpCode.closeSession) {
                     closing = true;
                 }
+                // 将构造好的packet放入outgoingQueue队列中，以供sendThread处理
                 outgoingQueue.add(packet);
             }
         }
+        // 数据包添加后，立即唤醒niosocket，这是nio的特性
         sendThread.getClientCnxnSocket().packetAdded();
         return packet;
     }

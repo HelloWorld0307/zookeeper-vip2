@@ -454,7 +454,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
     public synchronized void startup() {
 
-        // sessionTracker 是一个线程，用来关闭过期session
+        // sessionTracker 是一个线程，用来关闭过期session，判断所有已经连接到服务端的会话是否已经超时，（通过心跳来保证session不会过期）
         if (sessionTracker == null) {
             createSessionTracker();
         }

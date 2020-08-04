@@ -259,6 +259,16 @@ public class ZooKeeper implements AutoCloseable {
      * the public methods will not be exposed as part of the ZooKeeper client
      * API.
      */
+    /**
+     * 客户端三类，服务端两类
+     * 1. dataWatches：表示监听的是某节点的数据变化，比如数据的新增、修改、删除
+     * 2. childWathes：表示监听的是某节点的孩子节点的变化，如果某个节点新增或删除了，会触发其父节点上的NodeChildrenChanged事件
+     * 3. existWatches（只在客户端）：服务端无需单独触发该事件，由客户端接收其他事件自己判断，比如客户端接收到一个NodeCreated事件，
+     *     客户端如果注册了existWatches，那么existWatches就会被触发。
+     *
+     *
+     * 调用不同的方法的时候就会去执行不同的watcher类型，例如：调用getData，就会从dataWatches中获取。
+     */
     static class ZKWatchManager implements ClientWatchManager {
         private final Map<String, Set<Watcher>> dataWatches =
             new HashMap<String, Set<Watcher>>();
@@ -556,9 +566,14 @@ public class ZooKeeper implements AutoCloseable {
          * add the watch on the path.
          */
         public void register(int rc) {
+            // 只有在rc == 0表示请求没有错误时才注册watcher
             if (shouldAddWatch(rc)) {
+                // 当前watcherRegistration是什么类型就进入对应的getWatchers方法中
+                // 把watcher注册到ZKWatcher中
+                // 根据WatchRegistration具体的实现类，获取当前watcher应该要注册进去的map
                 Map<String, Set<Watcher>> watches = getWatches(rc);
                 synchronized(watches) {
+                    // 把当前的watcher添加到set中，完成watcher的注册
                     Set<Watcher> watchers = watches.get(clientPath);
                     if (watchers == null) {
                         watchers = new HashSet<Watcher>();
@@ -868,19 +883,28 @@ public class ZooKeeper implements AutoCloseable {
         LOG.info("Initiating client connection, connectString=" + connectString
                 + " sessionTimeout=" + sessionTimeout + " watcher=" + watcher);
 
+        // 初始化客户端配置
         if (clientConfig == null) {
             clientConfig = new ZKClientConfig();
         }
         this.clientConfig = clientConfig;
+        // 添加Watcher对象
         watchManager = defaultWatchManager();
         watchManager.defaultWatcher = watcher;
         ConnectStringParser connectStringParser = new ConnectStringParser(
                 connectString);
         hostProvider = aHostProvider;
 
+        // 直接new了一个ClientCnxn对象，在此方法中会分别new一个SentThread 和 eventThread来发送和监听数据，以及返回一个异步响应值
         cnxn = createConnection(connectStringParser.getChrootPath(),
-                hostProvider, sessionTimeout, this, watchManager,
-                getClientCnxnSocket(), canBeReadOnly);
+                                hostProvider,
+                                sessionTimeout,
+                      this,
+                                watchManager,
+                                // 默认是nio使用建立socket连接，也可以配置netty，这里不会去建立连接，只是拿到一个clientCnxnSocket对象
+                                getClientCnxnSocket(),
+                                canBeReadOnly);
+        // 启动sendThread 和 eventThread线程
         cnxn.start();
     }
 
@@ -947,6 +971,7 @@ public class ZooKeeper implements AutoCloseable {
      */
     public ZooKeeper(String connectString, int sessionTimeout, Watcher watcher,
             boolean canBeReadOnly) throws IOException {
+        // 当客户端配置的是多个地址，需要有一个特殊的类，对这些类进行管理
         this(connectString, sessionTimeout, watcher, canBeReadOnly,
                 createDefaultHostProvider(connectString));
     }
@@ -2125,7 +2150,11 @@ public class ZooKeeper implements AutoCloseable {
         GetDataRequest request = new GetDataRequest();
         request.setPath(serverPath);
         request.setWatch(watcher != null);
+
+        // 这里的response会在submitReques中处理，所以在最后可以获得响应
         GetDataResponse response = new GetDataResponse();
+
+        // 客户端提交请求，放入到outgoingQueue中给sendThread处理
         ReplyHeader r = cnxn.submitRequest(h, request, response, wcb);
         if (r.getErr() != 0) {
             throw KeeperException.create(KeeperException.Code.get(r.getErr()),
@@ -2161,6 +2190,7 @@ public class ZooKeeper implements AutoCloseable {
     }
 
     /**
+     * 异步的方式获取数据
      * The asynchronous version of getData.
      *
      * @see #getData(String, Watcher, Stat)
@@ -2185,6 +2215,7 @@ public class ZooKeeper implements AutoCloseable {
         request.setPath(serverPath);
         request.setWatch(watcher != null);
         GetDataResponse response = new GetDataResponse();
+        // 异步的方式获取数据
         cnxn.queuePacket(h, new ReplyHeader(), request, response, cb,
                 clientPath, serverPath, ctx, wcb);
     }
@@ -3061,6 +3092,7 @@ public class ZooKeeper implements AutoCloseable {
         }
         try {
             Constructor<?> clientCxnConstructor = Class.forName(clientCnxnSocketName).getDeclaredConstructor(ZKClientConfig.class);
+            // 这里只是得到了一个ClientCnxnSocket对象，并没有创建连接
             ClientCnxnSocket clientCxnSocket = (ClientCnxnSocket) clientCxnConstructor.newInstance(getClientConfig());
             return clientCxnSocket;
         } catch (Exception e) {

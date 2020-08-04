@@ -562,10 +562,13 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
 
             // Stop selecting this key while processing on its
             // connection
+            // 这里将NIOServerCnxn关闭掉，保证同一时间只能处理一个key，
             cnxn.disableSelectable();
             key.interestOps(0);
-            //  在CnxnExpiryQueue中添加和更新NIOServerCnxn，防止过期被清理
+            // 更新NIOServerCnxn上的时间，NIOServerCnxn也是一个对象，如果没有接收到数据（客户端一直没有发送数据和ping）
+            // 服务端就会清除长时间没有活动的客户端，所以这一步是来讲当前客户端延长连接时间的
             touchCnxn(cnxn);
+            // 给线程池处理workRequest
             workerPool.schedule(iOWorkRequest);
         }
 
@@ -649,11 +652,13 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                     selectorThread.cleanupSelectionKey(key);
                     return;
                 }
-                // 由于服务端会清除长时间没有活动的客户端，这一步是来讲当前客户端计时器清零
+                // 更新NIOServerCnxn上的时间，NIOServerCnxn也是一个对象，如果没有接收到数据（客户端一直没有发送数据和ping）
+                // 服务端就会清除长时间没有活动的客户端，所以这一步是来讲当前客户端延长连接时间的
                 touchCnxn(cnxn);
             }
 
             // Mark this connection as once again ready for selection
+            // 请求处理完毕后就可以开启，处理下一个key
             cnxn.enableSelectable();
             // Push an update request on the queue to resume selecting
             // on the current set of interest ops, which may have changed

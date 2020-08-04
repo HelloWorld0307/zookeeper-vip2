@@ -67,10 +67,12 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
      */
     void doIO(List<Packet> pendingQueue, ClientCnxn cnxn)
       throws InterruptedException, IOException {
+        // 获取SocketChannel连接对象
         SocketChannel sock = (SocketChannel) sockKey.channel();
         if (sock == null) {
             throw new IOException("Socket is null!");
         }
+        // 当前sockKey是可读事件，表明为服务端的响应
         if (sockKey.isReadable()) {
             int rc = sock.read(incomingBuffer);
             if (rc < 0) {
@@ -105,6 +107,7 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
                 }
             }
         }
+        // 如果为可写事件，表示发送数据到服务单
         if (sockKey.isWritable()) {
             Packet p = findSendablePacket(outgoingQueue,
                     sendThread.tunnelAuthInProgress());
@@ -116,17 +119,24 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
                     if ((p.requestHeader != null) &&
                             (p.requestHeader.getType() != OpCode.ping) &&
                             (p.requestHeader.getType() != OpCode.auth)) {
+                        // 如果不是ping，auth请求，则设置一个xid，xid是一个自增的id，如果服务端没有用到，客户端在接收响应的时候会用到xid
                         p.requestHeader.setXid(cnxn.getXid());
                     }
+                    // 把packet所表示的请求内容放入到bb中
                     p.createBB();
                 }
+                // 发送到服务单
                 sock.write(p.bb);
+
+                // 如果bb中没有数据了说明已经发送完毕
                 if (!p.bb.hasRemaining()) {
                     sentCount.getAndIncrement();
+                    // packet中的数据发送完了，就移除outgoingQueue中第一个数据
                     outgoingQueue.removeFirstOccurrence(p);
                     if (p.requestHeader != null
                             && p.requestHeader.getType() != OpCode.ping
                             && p.requestHeader.getType() != OpCode.auth) {
+                        // 将packet添加到pendingQueue中，是因为需要等待服务端响应结果
                         synchronized (pendingQueue) {
                             pendingQueue.add(p);
                         }
@@ -271,17 +281,28 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
      */
     void registerAndConnect(SocketChannel sock, InetSocketAddress addr) 
     throws IOException {
+        // 注册一个connect事件，同时给socketKey赋值，ClientCnxn是判断sockKey是否为空来判断是否建立连接的
         sockKey = sock.register(selector, SelectionKey.OP_CONNECT);
+        // 尝试去连接，由于是非阻塞式的，所以去尝试建立，如果上面一步的socket已经建立好了连接就会连接上
         boolean immediateConnect = sock.connect(addr);
         if (immediateConnect) {
+            // 连接初始化
             sendThread.primeConnection();
         }
     }
-    
+
+    /**
+     * NIO 建立socket建立连接
+     *
+     * @param addr 连接地址
+     * @throws IOException
+     */
     @Override
     void connect(InetSocketAddress addr) throws IOException {
-        SocketChannel sock = createSock();
+        // 生成一个SocketChannel
+        SocketChannel  sock = createSock();
         try {
+            // 注册事件以及创建连接
            registerAndConnect(sock, addr);
       } catch (IOException e) {
             LOG.error("Unable to open socket to " + addr);
@@ -340,7 +361,7 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
     }
     
     @Override
-    void doTransport(int waitTimeOut, List<Packet> pendingQueue, ClientCnxn cnxn)
+    void  doTransport(int waitTimeOut, List<Packet> pendingQueue, ClientCnxn cnxn)
             throws IOException, InterruptedException {
         selector.select(waitTimeOut);
         Set<SelectionKey> selected;
@@ -353,13 +374,19 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
         updateNow();
         for (SelectionKey k : selected) {
             SocketChannel sc = ((SocketChannel) k.channel());
+            // 可以连接的就绪事件
             if ((k.readyOps() & SelectionKey.OP_CONNECT) != 0) {
+
+                // 再次判断到底有没有建立连接
                 if (sc.finishConnect()) {
+                    // socket连接成功后，进行一些连接初始化
                     updateLastSendAndHeard();
+                    // 连接成功后更新lastSend 和lastHeard
                     updateSocketAddresses();
+                    // 连接初始化
                     sendThread.primeConnection();
                 }
-            } else if ((k.readyOps() & (SelectionKey.OP_READ | SelectionKey.OP_WRITE)) != 0) {
+            } else if ((k.readyOps() & (SelectionKey.OP_READ | SelectionKey.OP_WRITE)) != 0) {  // 这里读服务端响应数据
                 doIO(pendingQueue, cnxn);
             }
         }
@@ -419,6 +446,7 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
         return selector;
     }
 
+    // 将数据packet包发送到服务单
     @Override
     void sendPacket(Packet p) throws IOException {
         SocketChannel sock = (SocketChannel) sockKey.channel();
@@ -427,6 +455,7 @@ public class ClientCnxnSocketNIO extends ClientCnxnSocket {
         }
         p.createBB();
         ByteBuffer pbb = p.bb;
+        // 发送到服务端
         sock.write(pbb);
     }
 }

@@ -99,6 +99,7 @@ public class ZKConfig {
      * this configuration.
      */
     protected void handleBackwardCompatibility() {
+        // 通过读取脚本的配置，来生成一个客户端配置项
         properties.put(JUTE_MAXBUFFER, System.getProperty(JUTE_MAXBUFFER));
         properties.put(KINIT_COMMAND, System.getProperty(KINIT_COMMAND));
         properties.put(JGSS_NATIVE, System.getProperty(JGSS_NATIVE));
